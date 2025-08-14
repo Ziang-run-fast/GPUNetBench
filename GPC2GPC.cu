@@ -1,236 +1,217 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
+#ifndef CLUSTER_SIZE
+#define CLUSTER_SIZE 16
+#endif
+#ifndef ILP_FACTOR
+#define ILP_FACTOR 8
+#endif
 #ifndef ITERATION
 #define ITERATION 10000
 #endif
+#ifndef STRIDE
+#define STRIDE 1
+#endif
 
-// 获取SM ID的内联PTX
+#if !defined(CALC_BW) && !defined(CALC_LATENCY)
+#define CALC_BW
+#endif
+
+namespace cg = cooperative_groups;
+
 __device__ inline unsigned int get_smid() {
     unsigned int smid;
     asm("mov.u32 %0, %%smid;" : "=r"(smid));
     return smid;
 }
 
-/*
- * 跨GPC的L2缓存通信内核
- * 移除线程块集群约束，让GPU调度器将块分配到不同GPC
- */
-__global__ void cross_gpc_l2_kernel(int *global_buffer, 
-                                    unsigned long long *results, 
-                                    int num_ints,
-                                    int rt_destSM,
-                                    int rt_srcSM) {
-    // 使用相同的rank概念，但不依赖cluster
-    int rank = blockIdx.x % 16;  // 模拟16个rank
+__global__ __cluster_dims__(CLUSTER_SIZE, 1, 1)
+void kernel(unsigned long long *out,
+            int num_ints,
+            int rt_destSM,
+            int rt_srcSM,
+            int *l2buf) {                    // *** NEW: 全局(L2)缓冲区
+  extern __shared__ int sdata[];
+
+  cg::cluster_group cluster = cg::this_cluster();
+  unsigned int rank = cluster.block_rank();
+  int cluster_id = blockIdx.x / CLUSTER_SIZE;
+
+  // --- 计算本 cluster 在 l2buf 中的切片基址 ---
+  int * __restrict__ ws = l2buf + cluster_id * num_ints;   // *** NEW: 用全局内存做“共享区”
+
+  // === WARM & record destSM ===
+  if (rank == rt_destSM && threadIdx.x == 0) {
     unsigned int my_smid = get_smid();
-    
-    // === 数据准备阶段（目标rank）===
-    if (rank == rt_destSM && threadIdx.x == 0) {
-        // 记录目标SM ID
-        results[0] = my_smid;
-        
-        // 填充全局内存缓冲区（代替共享内存）
-        for (int i = 0; i < num_ints; i++) {
-            global_buffer[i] = my_smid + i;
-        }
-        
-        // 设置数据就绪标志
-        global_buffer[num_ints] = 1;  // 使用缓冲区末尾作为标志
+  #ifdef CALC_BW
+    out[3 * cluster_id + 0] = my_smid;
+  #else
+    out[cluster_id * (blockDim.x + 2) + 0] = my_smid;
+  #endif
+    // 将数据写入全局内存（驻留 L2）
+    ws[0] = my_smid;
+    for (int i = 1; i < num_ints; i++) {
+      ws[i] = my_smid + i;
     }
-    
-    // 等待数据准备完成
+    __threadfence();   // *** NEW: 保证写入对其他 SM 可见（推送到 L2）
+  }
+
+  int local_sum = 0;
+#ifdef CALC_LATENCY
+  unsigned long long lat_acc = 0, lat_cnt = 0;
+#endif
+
+  // 等待写端完成
+  cluster.sync();
+
+  // === READ & record srcSM + timing ===
+  if (rank == rt_srcSM) {
+#ifdef CALC_BW
+    unsigned long long startCycles = clock64();
+#endif
+
+    for (int rep = 0; rep < ITERATION; rep++) {
+      int idx = threadIdx.x * STRIDE;
+
+      for (; idx + (ILP_FACTOR - 1) * blockDim.x * STRIDE < num_ints;
+            idx += blockDim.x * ILP_FACTOR * STRIDE) {
+#ifdef CALC_LATENCY
+        unsigned long long t0 = clock();
+#endif
+#pragma unroll
+        for (int j = 0; j < ILP_FACTOR; j++) {
+          // *** NEW: 强制从 L2 读取，绕过各自 L1
+          local_sum += __ldcg(&ws[idx + j * blockDim.x * STRIDE]);
+        }
+#ifdef CALC_LATENCY
+        unsigned long long t1 = clock();
+        lat_acc += (t1 - t0);
+        lat_cnt++;
+#endif
+      }
+      // tail
+      for (; idx < num_ints; idx += blockDim.x * STRIDE) {
+#ifdef CALC_LATENCY
+        unsigned long long t0 = clock();
+#endif
+        local_sum += __ldcg(&ws[idx]);       // *** NEW
+#ifdef CALC_LATENCY
+        unsigned long long t1 = clock();
+        lat_acc += (t1 - t0);
+        lat_cnt++;
+#endif
+      }
+    }
+
     __syncthreads();
-    __threadfence();
-    
-    // === 延迟测量阶段（源rank）===
-    if (rank == rt_srcSM) {
-        // 等待目标rank完成数据准备
-        if (threadIdx.x == 0) {
-            while (atomicAdd(&global_buffer[num_ints], 0) == 0) {
-                // 自旋等待
-            }
-        }
-        __syncthreads();
-        
-        // 开始延迟测量（与原代码保持一致的数据访问模式）
-        unsigned long long lat_acc = 0, lat_cnt = 0;
-        int local_sum = 0;
-        
-        for (int rep = 0; rep < ITERATION; rep++) {
-            int idx = threadIdx.x;  // 对应原代码的 threadIdx.x * STRIDE，STRIDE=1
-            
-            // 模拟原代码的访问模式
-            for (; idx < num_ints; idx += blockDim.x) {
-                unsigned long long t0 = clock();
-                
-                // 从全局内存（L2缓存）读取数据
-                local_sum += global_buffer[idx];
-                
-                unsigned long long t1 = clock();
-                lat_acc += (t1 - t0);
-                lat_cnt++;
-            }
-        }
-        
-        __syncthreads();
-        
-        // 存储结果（与原代码格式一致）
-        unsigned long long avgLat = lat_cnt ? (lat_acc / lat_cnt) : 0;
-        int base = blockIdx.x * (blockDim.x + 2);
-        
-        if (threadIdx.x == 0) {
-            results[1] = my_smid;  // 源SM ID
-        }
-        
-        // 每个线程的平均延迟
-        results[base + 2 + threadIdx.x] = avgLat;
-        
-        // 防止编译器优化
-        global_buffer[threadIdx.x % num_ints] = local_sum;
-    }
+
+#ifdef CALC_BW
+    unsigned long long totalCycles = clock64() - startCycles;
+    unsigned int my_smid = get_smid();
+    out[3 * cluster_id + 1] = my_smid;
+    out[3 * cluster_id + 2] = totalCycles;
+#endif
+#ifdef CALC_LATENCY
+    unsigned long long avgLat = lat_cnt ? (lat_acc / lat_cnt) : 0;
+    int base = cluster_id * (blockDim.x + 2);
+    out[base + 1] = get_smid();
+    out[base + 2 + threadIdx.x] = avgLat;
+#endif
+  }
+
+  // 防优化
+  sdata[threadIdx.x] = local_sum;
+
+  cluster.sync();
 }
 
 int main(int argc, char **argv) {
-    // 参数解析（与原代码保持一致）
-    int rt_destSM = (argc > 1) ? atoi(argv[1]) : 1;
-    int rt_srcSM = (argc > 2) ? atoi(argv[2]) : 0;
-    int total_blocks = (argc > 3) ? atoi(argv[3]) : 32;  // 增加块数以提高跨GPC概率
-    int blockSize = (argc > 4) ? atoi(argv[4]) : 1024;
-    
-    printf("Cross-GPC L2 Cache Communication Latency Test (L1 Bypass)\n");
-    printf("Using __ldcg/__stcg to force L2-only access\n");
-    printf("Target rank: %d, Source rank: %d\n", rt_destSM, rt_srcSM);
-    printf("Total blocks: %d, Block size: %d\n", total_blocks, blockSize);
-    
-    // 设备属性
-    int dev = 0;
-    cudaDeviceProp prop;
-    cudaSetDevice(dev);
-    cudaGetDeviceProperties(&prop, dev);
-    
-    printf("GPU: %s (Total SMs: %d)\n", prop.name, prop.multiProcessorCount);
-    
-    // 计算共享内存等效大小（与原代码一致）
-    int maxSMemOptin;
-    cudaDeviceGetAttribute(&maxSMemOptin,
-        cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-    size_t shared_bytes = maxSMemOptin;
-    int num_ints = shared_bytes / sizeof(int);
-    
-    printf("Using buffer size: %d ints (%.2f KB)\n", num_ints, shared_bytes / 1024.0);
-    
-    // 分配内存
-    int *d_buffer;
-    unsigned long long *d_results, *h_results;
-    
-    // 分配大于L1缓存但小于L2缓存的缓冲区，确保使用L2
-    size_t l1_cache_size = 128 * 1024;  // H100 L1缓存大小约128KB
-    size_t buffer_size = max((size_t)(num_ints + 1) * sizeof(int), l1_cache_size * 2);
-    
-    printf("Allocating buffer size: %.2f MB (larger than L1 to force L2 usage)\n", 
-           buffer_size / (1024.0 * 1024.0));
-    
-    // 全局内存缓冲区，确保超出L1缓存大小
-    cudaMalloc(&d_buffer, buffer_size);
-    cudaMemset(d_buffer, 0, buffer_size);
-    
-    // 预热L2缓存：先访问一遍数据
-    printf("Warming L2 cache...\n");
-    int *warmup_data = (int*)malloc(buffer_size);
-    for (int i = 0; i < buffer_size / sizeof(int); i++) {
-        warmup_data[i] = i;
+  int rt_destSM   = 1;
+  int rt_srcSM    = 0;
+  int numClusters = 1;
+  int blockSize   = 1024;
+
+  if (argc > 1) rt_destSM   = atoi(argv[1]);
+  if (argc > 2) rt_srcSM    = atoi(argv[2]);
+  if (argc > 3) numClusters = atoi(argv[3]);
+  if (argc > 4) blockSize   = atoi(argv[4]);
+
+  int dev = 0;
+  cudaDeviceProp prop;
+  cudaGetDevice(&dev);
+  cudaGetDeviceProperties(&prop, dev);
+
+  int maxSMemOptin;
+  cudaDeviceGetAttribute(&maxSMemOptin,
+    cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  size_t shared_bytes = maxSMemOptin;
+  int num_ints = (int)(shared_bytes / sizeof(int));  // 仍复用同样的数据规模
+
+  int total_blocks = numClusters * CLUSTER_SIZE;
+  size_t out_size;
+#ifdef CALC_BW
+  out_size = numClusters * 3 * sizeof(unsigned long long);
+#else
+  out_size = numClusters * (blockSize + 2) * sizeof(unsigned long long);
+#endif
+
+  unsigned long long *d_out, *h_out;
+  h_out = (unsigned long long*)malloc(out_size);
+  cudaMalloc(&d_out, out_size);
+
+  // *** NEW: 为 L2“共享区”分配全局内存（每个 cluster 一段）
+  int *d_l2buf = nullptr;
+  cudaMalloc(&d_l2buf, (size_t)numClusters * num_ints * sizeof(int));   // *** NEW
+
+  cudaFuncSetAttribute(kernel,
+    cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  cudaFuncSetAttribute(kernel,
+    cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
+  cudaFuncSetAttribute(kernel,
+    cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+
+  kernel<<< total_blocks, blockSize, shared_bytes >>>(
+    d_out, num_ints, rt_destSM, rt_srcSM, d_l2buf);  // *** NEW: 传入 d_l2buf
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(h_out, d_out, out_size, cudaMemcpyDeviceToHost);
+
+  double clkHz = prop.clockRate * 1e3;
+
+#ifdef CALC_BW
+  for (int i = 0; i < numClusters; i++) {
+    unsigned long long destSM = h_out[3*i + 0];
+    unsigned long long srcSM  = h_out[3*i + 1];
+    unsigned long long cycles = h_out[3*i + 2];
+    unsigned long long bytes  =
+      (unsigned long long)num_ints * sizeof(int) * ITERATION;
+    double bpc = (double)bytes / (double)cycles;
+    double bw  = bpc * clkHz / 1e9;
+    printf("Cluster %d destSM %llu srcSM %llu Bandwidth %.4f GB/s\n",
+           i, destSM, srcSM, bw);
+  }
+#else
+  for (int i = 0; i < numClusters; i++) {
+    double average = 0;
+    int base = i * (blockSize + 2);
+    unsigned long long destSM = h_out[base + 0];
+    unsigned long long srcSM  = h_out[base + 1];
+    for (int j = 0; j < blockSize; j++) {
+      unsigned long long avgLat = h_out[base + 2 + j];
+      average += avgLat;
     }
-    cudaMemcpy(d_buffer, warmup_data, buffer_size, cudaMemcpyHostToDevice);
-    free(warmup_data);
-    
-    // 结果数组（与原代码延迟模式格式一致）
-    size_t results_size = total_blocks * (blockSize + 2) * sizeof(unsigned long long);
-    cudaMalloc(&d_results, results_size);
-    cudaMemset(d_results, 0, results_size);
-    
-    h_results = (unsigned long long*)malloc(results_size);
-    
-    // 启动内核：使用更多块来增加跨GPC通信的概率
-    printf("\nLaunching kernel with %d blocks...\n", total_blocks);
-    
-    cross_gpc_l2_kernel<<<total_blocks, blockSize>>>(
-        d_buffer, d_results, num_ints, rt_destSM, rt_srcSM, buffer_size);
-    
-    cudaError_t err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        printf("CUDA Error: %s\n", cudaGetErrorString(err));
-        return 1;
-    }
-    
-    // 复制结果
-    cudaMemcpy(h_results, d_results, results_size, cudaMemcpyDeviceToHost);
-    
-    // 分析结果
-    unsigned long long dest_sm = h_results[0];
-    unsigned long long src_sm = h_results[1];
-    
-    printf("\nCommunication Results:\n");
-    printf("Destination SM (rank %d): %llu\n", rt_destSM, dest_sm);
-    printf("Source SM (rank %d): %llu\n", rt_srcSM, src_sm);
-    
-    // 判断是否为跨GPC通信（基于SM ID差异）
-    long long sm_diff = (long long)src_sm - (long long)dest_sm;
-    printf("SM ID Difference: %lld\n", sm_diff);
-    
-    if (abs((int)sm_diff) > 16) {
-        printf("LIKELY Cross-GPC Communication: SM %llu -> SM %llu\n", dest_sm, src_sm);
-    } else {
-        printf("LIKELY Intra-GPC Communication: SM %llu -> SM %llu\n", dest_sm, src_sm);
-    }
-    
-    // 计算延迟统计（与原代码一致的方式）
-    double total_latency = 0;
-    unsigned long long min_latency = ULLONG_MAX;
-    unsigned long long max_latency = 0;
-    
-    // 找到源rank对应的块
-    int src_block = -1;
-    for (int b = 0; b < total_blocks; b++) {
-        if ((b % 16) == rt_srcSM) {
-            src_block = b;
-            break;
-        }
-    }
-    
-    if (src_block >= 0) {
-        int base = src_block * (blockSize + 2);
-        
-        printf("\nPer-thread Latency (first 10 threads, clock cycles):\n");
-        for (int t = 0; t < blockSize; t++) {
-            unsigned long long lat = h_results[base + 2 + t];
-            total_latency += lat;
-            if (lat < min_latency && lat > 0) min_latency = lat;
-            if (lat > max_latency) max_latency = lat;
-            
-            if (t < 10) {  // 只显示前10个线程
-                printf("Thread %2d: %llu cycles\n", t, lat);
-            }
-        }
-        
-        double avg_latency = total_latency / blockSize;
-        
-        printf("\nLatency Statistics:\n");
-        printf("Average Latency: %.2f clock cycles\n", avg_latency);
-        printf("Min Latency: %llu clock cycles\n", min_latency);
-        printf("Max Latency: %llu clock cycles\n", max_latency);
-        
-        // 与原代码输出格式一致
-        printf("\nResult Summary:\n");
-        printf("Block %d destSM %llu srcSM %llu Avg Latency %.4f clock cycles\n",
-               src_block, dest_sm, src_sm, avg_latency);
-    }
-    
-    // 清理内存
-    cudaFree(d_buffer);
-    cudaFree(d_results);
-    free(h_results);
-    
-    return 0;
+    average /= blockSize;
+    printf("Cluster %d destSM %llu srcSM %llu Avg Latency %.4f clock cycles\n",
+           i, destSM, srcSM, average);
+  }
+#endif
+
+  cudaFree(d_l2buf);   // *** NEW
+  cudaFree(d_out);
+  free(h_out);
+  return 0;
 }
