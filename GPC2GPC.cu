@@ -99,7 +99,8 @@ int main(int argc, char **argv) {
     int total_blocks = (argc > 3) ? atoi(argv[3]) : 32;  // 增加块数以提高跨GPC概率
     int blockSize = (argc > 4) ? atoi(argv[4]) : 1024;
     
-    printf("Cross-GPC L2 Cache Communication Latency Test\n");
+    printf("Cross-GPC L2 Cache Communication Latency Test (L1 Bypass)\n");
+    printf("Using __ldcg/__stcg to force L2-only access\n");
     printf("Target rank: %d, Source rank: %d\n", rt_destSM, rt_srcSM);
     printf("Total blocks: %d, Block size: %d\n", total_blocks, blockSize);
     
@@ -124,9 +125,25 @@ int main(int argc, char **argv) {
     int *d_buffer;
     unsigned long long *d_results, *h_results;
     
-    // 全局内存缓冲区（+1个int用作同步标志）
-    cudaMalloc(&d_buffer, (num_ints + 1) * sizeof(int));
-    cudaMemset(&d_buffer, 0, (num_ints + 1) * sizeof(int));
+    // 分配大于L1缓存但小于L2缓存的缓冲区，确保使用L2
+    size_t l1_cache_size = 128 * 1024;  // H100 L1缓存大小约128KB
+    size_t buffer_size = max((size_t)(num_ints + 1) * sizeof(int), l1_cache_size * 2);
+    
+    printf("Allocating buffer size: %.2f MB (larger than L1 to force L2 usage)\n", 
+           buffer_size / (1024.0 * 1024.0));
+    
+    // 全局内存缓冲区，确保超出L1缓存大小
+    cudaMalloc(&d_buffer, buffer_size);
+    cudaMemset(d_buffer, 0, buffer_size);
+    
+    // 预热L2缓存：先访问一遍数据
+    printf("Warming L2 cache...\n");
+    int *warmup_data = (int*)malloc(buffer_size);
+    for (int i = 0; i < buffer_size / sizeof(int); i++) {
+        warmup_data[i] = i;
+    }
+    cudaMemcpy(d_buffer, warmup_data, buffer_size, cudaMemcpyHostToDevice);
+    free(warmup_data);
     
     // 结果数组（与原代码延迟模式格式一致）
     size_t results_size = total_blocks * (blockSize + 2) * sizeof(unsigned long long);
@@ -139,7 +156,7 @@ int main(int argc, char **argv) {
     printf("\nLaunching kernel with %d blocks...\n", total_blocks);
     
     cross_gpc_l2_kernel<<<total_blocks, blockSize>>>(
-        d_buffer, d_results, num_ints, rt_destSM, rt_srcSM);
+        d_buffer, d_results, num_ints, rt_destSM, rt_srcSM, buffer_size);
     
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
