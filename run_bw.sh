@@ -1,12 +1,20 @@
 #!/bin/bash
 
-# 清空旧的日志文件
-> result_BW.log
+# 固定 blockSize
+BLOCKSIZE=1024
 
-# 循环 blockSize = 32, 64, ..., 1024
-for blockSize in $(seq 32 32 1024)
-do
-    echo "Running blockSize = $blockSize" | tee -a result_BW.log
-    ./SM2SM 1 0 1 $blockSize | tee -a result_BW.log
-    echo "" >> result_BW.log
+# 总 SM 数
+TOTAL_SM=132
+
+# 保存结果文件
+LOGFILE="result_SM2SM.log"
+> "$LOGFILE"
+
+for ((dstSM=0; dstSM<$TOTAL_SM; dstSM++)); do
+    for ((srcSM=0; srcSM<$TOTAL_SM; srcSM++)); do
+        if [ $dstSM -ne $srcSM ]; then
+            echo "Running dstSM=$dstSM srcSM=$srcSM" | tee -a "$LOGFILE"
+            ./SM2SM $dstSM $srcSM 1 $BLOCKSIZE | tee -a "$LOGFILE"
+        fi
+    done
 done
