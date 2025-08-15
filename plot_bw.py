@@ -1,34 +1,56 @@
+# plot_latency_dist.py
 import re
+import sys
+import statistics as stats
 import matplotlib.pyplot as plt
 
-log_file = "result_BW.log"
+def parse_latencies(log_path: str):
+    """
+    从日志中提取 'Avg xxx.xx cycles/group' 的延迟数值，返回 float 列表。
+    兼容形如：
+    'Inter-GPC L2  destSM 0  srcSM 1  Avg 302.00 cycles/group'
+    """
+    pattern = re.compile(r"Avg\s+([0-9]+(?:\.[0-9]+)?)\s+cycles/group")
+    values = []
+    with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            m = pattern.search(line)
+            if m:
+                values.append(float(m.group(1)))
+    return values
 
-# 读取日志文件
-with open(log_file, "r") as f:
-    log_data = f.read()
+def main():
+    log_file = "result_SM2SM.log" if len(sys.argv) < 2 else sys.argv[1]
+    vals = parse_latencies(log_file)
+    if not vals:
+        print(f"[WARN] No latency values found in {log_file}")
+        return
 
-# 正则匹配 blockSize 和 Bandwidth
-pattern = r"Running blockSize = (\d+)\s+Cluster.*Bandwidth ([\d\.]+) GB/s"
-matches = re.findall(pattern, log_data)
+    # 打印一些统计
+    print(f"[INFO] parsed {len(vals)} latencies from {log_file}")
+    print(f"  min = {min(vals):.2f} cycles/group")
+    print(f"  p50 = {stats.median(vals):.2f} cycles/group")
+    try:
+        print(f"  mean = {stats.mean(vals):.2f} cycles/group")
+        print(f"  stdev = {stats.pstdev(vals):.2f} cycles/group")
+    except stats.StatisticsError:
+        pass
+    print(f"  max = {max(vals):.2f} cycles/group")
 
-# 转换为数值
-block_sizes = [int(m[0]) for m in matches]
-bandwidths = [float(m[1]) for m in matches]
+    # 画直方图（分布图）
+    plt.figure(figsize=(8, 5))
+    plt.hist(vals, bins='auto', edgecolor='black')
+    plt.title("Latency Distribution (cycles per group)")
+    plt.xlabel("Latency (cycles/group)")
+    plt.ylabel("Count")
+    plt.tight_layout()
 
-# 绘制散点图
-plt.figure(figsize=(8, 6))
-plt.scatter(block_sizes, bandwidths, color='blue', label='Measured Bandwidth')
-plt.plot(block_sizes, bandwidths, color='orange', linestyle='--', alpha=0.7, label='Trend')
+    out_png = "latency_distribution.png"
+    plt.savefig(out_png, dpi=300)
+    print(f"[INFO] saved figure -> {out_png}")
 
-plt.title("Bandwidth vs BlockSize")
-plt.xlabel("BlockSize")
-plt.ylabel("Bandwidth (GB/s)")
-plt.grid(True, linestyle='--', alpha=0.5)
-plt.legend()
-plt.tight_layout()
+    # 如需在本地弹窗显示，取消下一行注释
+    # plt.show()
 
-# 保存图片
-plt.savefig("bandwidth_vs_blocksize.png", dpi=300)  # 高分辨率PNG
-# plt.savefig("bandwidth_vs_blocksize.pdf")  # 如果要保存为PDF
-
-plt.show()
+if __name__ == "__main__":
+    main()
