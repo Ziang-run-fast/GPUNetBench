@@ -1,258 +1,148 @@
-
-#include <stdio.h>
-#include <stdlib.h>
+// discover_gpc_by_cluster.cu
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
+#include <algorithm>
+#include <cstdio>
+#include <vector>
+#include <set>
+#include <queue>
+
 namespace cg = cooperative_groups;
 
 #ifndef CLUSTER_SIZE
-#define CLUSTER_SIZE 16
+#define CLUSTER_SIZE 16   // Hopper 常见 8/16，按需改
 #endif
-#ifndef ILP_FACTOR
-#define ILP_FACTOR 8
-#endif
-#ifndef ITERATION
-#define ITERATION 10000
-#endif
-#ifndef STRIDE
-#define STRIDE 1
-#endif
-#ifndef MAX_ATTEMPTS
-#define MAX_ATTEMPTS 32   // 多次尝试以提高命中概率
-#endif
-
-// 默认为“延迟模式”；如需带宽，可 -DCALC_BW（但探测本身看成功与否即可）
-#if !defined(CALC_BW) && !defined(CALC_LATENCY)
-#define CALC_LATENCY
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 128
 #endif
 
 __device__ __forceinline__ unsigned get_smid() {
   unsigned smid; asm volatile("mov.u32 %0, %%smid;" : "=r"(smid)); return smid;
 }
 
-// 每个“逻辑 cluster”的控制区
-struct Ctrl {
-  int writer_rank;   // -1 表示尚未选出
-  int reader_rank;   // -1 表示尚未选出
-  int success;       // 0/1：是否在该 cluster 成功完成一次 DSM 通信
-};
-
+// 把每个 block 的 SMID 记到按 cluster 编址的数组中
 __global__ __cluster_dims__(CLUSTER_SIZE,1,1)
-void kernel_probe_dsm(
-    double               *avg_lat_out,   // 每 cluster 一个输出：cycles/group
-    Ctrl                 *ctrl,          // 每 cluster 控制区
-    int                   num_ints,
-    int                   dstSM,         // 目标写端 SM
-    int                   srcSM)         // 目标读端 SM
-{
-  extern __shared__ int sdata[]; // 写端 block 的共享内存将被映射给读端
+void dump_cluster_smids(int *smid_out) {
   cg::cluster_group cluster = cg::this_cluster();
-  const int   cluster_id = blockIdx.x / CLUSTER_SIZE;
-  const int   rank       = (int)cluster.block_rank();
-  Ctrl *C = &ctrl[cluster_id];
-
-  // 把 writer/reader 的 rank 初始化为 -1（只做一次即可；并发写无所谓）
+  const int rank       = (int)cluster.block_rank();          // 0..CLUSTER_SIZE-1
+  const int cluster_id = (int)blockIdx.x / CLUSTER_SIZE;     // 0..numClusters-1
+  const int idx        = cluster_id * CLUSTER_SIZE + rank;
   if (threadIdx.x == 0) {
-    if (C->writer_rank != -1 && C->reader_rank != -1) {
-      // 上一轮遗留；这里不强制清理，因为 host 每次 attempt 都会 memset
-    }
+    smid_out[idx] = (int)get_smid();
   }
-
-  // 依据实际运行的 SM 选择角色候选
-  const unsigned mySM = get_smid();
-  if (mySM == (unsigned)dstSM) {
-    // 只有一个 block 能成为“写端”
-    atomicCAS(&C->writer_rank, -1, rank);
-  }
-  if (mySM == (unsigned)srcSM) {
-    // 只有一个 block 能成为“读端”
-    atomicCAS(&C->reader_rank, -1, rank);
-  }
-
-  // 同一个 cluster 内部对齐
-  cluster.sync();
-
-  const int w = C->writer_rank;
-  const int r = C->reader_rank;
-
-  // 只有当写端和读端都在同一个 cluster 才能进行 DSMEM 通信
-  if (w != -1 && r != -1) {
-    const bool isWriter = (rank == w);
-    const bool isReader = (rank == r);
-
-    // 写端准备数据
-    if (isWriter && threadIdx.x == 0) {
-      sdata[0] = 1;
-      for (int i=1; i<num_ints; ++i) sdata[i] = sdata[i-1] + 1;
-    }
-
-    // 写端准备好后，整个 cluster 同步
-    cluster.sync();
-
-#ifdef CALC_BW
-    unsigned long long start = 0;
-#else
-    unsigned long long lat_acc = 0ULL, lat_cnt = 0ULL;
-#endif
-
-    if (isReader) {
-      // 读端把写端 block 的共享内存映射进来
-      int * __restrict__ ws = cluster.map_shared_rank(sdata, w);
-
-#ifdef CALC_BW
-      start = clock64();
-#else
-      int sink = 0;
-#endif
-      // 读循环
-      for (int rep=0; rep<ITERATION; ++rep) {
-        int idx = threadIdx.x * STRIDE;
-
-        // 主体段：ILP 组
-        for (; idx + (ILP_FACTOR - 1)*blockDim.x*STRIDE < num_ints;
-               idx += blockDim.x * ILP_FACTOR * STRIDE)
-        {
-#ifdef CALC_LATENCY
-          unsigned long long t0 = clock();
-#endif
-#pragma unroll
-          for (int j=0; j<ILP_FACTOR; ++j) {
-#ifdef CALC_LATENCY
-            sink += ws[idx + j*blockDim.x*STRIDE];
-#else
-            (void)ws[idx + j*blockDim.x*STRIDE];
-#endif
-          }
-#ifdef CALC_LATENCY
-          unsigned long long t1 = clock();
-          lat_acc += (t1 - t0);
-          lat_cnt++;
-#endif
-        }
-        // 尾部
-        for (; idx < num_ints; idx += blockDim.x * STRIDE) {
-#ifdef CALC_LATENCY
-          unsigned long long t0 = clock();
-          sink += ws[idx];
-          unsigned long long t1 = clock();
-          lat_acc += (t1 - t0);
-          lat_cnt++;
-#else
-          (void)ws[idx];
-#endif
-        }
-      }
-#ifdef CALC_LATENCY
-      (void)sink;
-#endif
-    }
-
-    // 再同步一次，确保计时结果就绪
-    cluster.sync();
-
-    if (isReader && threadIdx.x == 0) {
-#ifdef CALC_BW
-      unsigned long long cyc = clock64() - start;
-      // 如需带宽可在 host 侧换算；这里我们仍写入“平均每组周期”风格
-      avg_lat_out[cluster_id] = (double)cyc; // 带宽模式下留给 host 处理
-#else
-      const double avg = (lat_cnt ? (double)lat_acc / (double)lat_cnt : 0.0);
-      avg_lat_out[cluster_id] = avg;  // cycles per ILP-group
-#endif
-      C->success = 1; // 标记该 cluster 成功
-    }
-  }
-  // 该 cluster 若两端不齐（w或r为-1），所有 block 都直接返回，本次 attempt 失败
 }
 
-int main(int argc, char **argv) {
-  int dstSM = 1, srcSM = 0, numClusters = 1, blockSize = 1024;
-  if (argc > 1) dstSM      = atoi(argv[1]);
-  if (argc > 2) srcSM      = atoi(argv[2]);
-  if (argc > 3) numClusters= atoi(argv[3]);
-  if (argc > 4) blockSize  = atoi(argv[4]);
-
-  // 设备信息
-  int dev = 0; cudaSetDevice(dev);
-  cudaDeviceProp prop{}; cudaGetDeviceProperties(&prop, dev);
-  const double clkHz = prop.clockRate * 1e3;
-
-  // 动态共享内存大小沿用“共享内存上限”作为数据规模
-  int maxSMemOptin=0;
-  cudaDeviceGetAttribute(&maxSMemOptin,
-     cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-  const size_t shared_bytes = (size_t)maxSMemOptin;
-  const int num_ints = (int)(shared_bytes / sizeof(int));
-
-  // 为 cluster kernel 设置属性
-  cudaFuncSetAttribute(kernel_probe_dsm,
-    cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-  cudaFuncSetAttribute(kernel_probe_dsm,
-    cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
-  cudaFuncSetAttribute(kernel_probe_dsm,
-    cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-
-  // 设备端缓冲
-  const int total_blocks = numClusters * CLUSTER_SIZE;
-  double *d_avg = nullptr;  cudaMalloc(&d_avg, numClusters * sizeof(double));
-  Ctrl   *d_ctl = nullptr;  cudaMalloc(&d_ctl, numClusters * sizeof(Ctrl));
-
-  // 主机端缓冲
-  double *h_avg = (double*)malloc(numClusters * sizeof(double));
-  Ctrl   *h_ctl = (Ctrl*)  malloc(numClusters * sizeof(Ctrl));
-
-  bool ok = false;
-  int  ok_cluster = -1;
-
-  // 多次尝试：随机性来自调度，增大 numClusters 和 MAX_ATTEMPTS 可提高命中
-  for (int attempt = 1; attempt <= MAX_ATTEMPTS && !ok; ++attempt) {
-    // 清空控制区：writer_rank/reader_rank 设为 -1，success=0
-    cudaMemset(d_ctl, 0xFF, numClusters * sizeof(Ctrl)); // -1
-    // 把 success 字段清零（位于结构体中，重新覆盖）
-    // 简单方案：再发一个小核清 success=0；这里用 cudaMemset2D-like 不方便，改为小核
-    // 但为简洁，host 再 copy 回来时以 success!=1 判定即可。
-
-    // 启动 kernel
-    kernel_probe_dsm<<< total_blocks, blockSize, shared_bytes >>>(
-      d_avg, d_ctl, num_ints, dstSM, srcSM);
-    cudaDeviceSynchronize();
-
-    // 拿回结果，检查是否有 cluster 成功
-    cudaMemcpy(h_ctl, d_ctl, numClusters * sizeof(Ctrl), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_avg, d_avg, numClusters * sizeof(double), cudaMemcpyDeviceToHost);
-
-    for (int c=0; c<numClusters; ++c) {
-      if (h_ctl[c].success == 1) { ok = true; ok_cluster = c; break; }
+static void bfs_groups(const std::vector<std::vector<int>>& adj,
+                       std::vector<int>& comp_id,
+                       std::vector<std::vector<int>>& groups)
+{
+  const int N = (int)adj.size();
+  comp_id.assign(N, -1);
+  int cid = 0;
+  for (int s=0; s<N; ++s) {
+    if (adj[s].empty() || comp_id[s] != -1) continue;
+    std::queue<int> q; q.push(s); comp_id[s] = cid;
+    std::vector<int> comp{ s };
+    while (!q.empty()) {
+      int u = q.front(); q.pop();
+      for (int v: adj[u]) if (comp_id[v] == -1) {
+        comp_id[v] = cid; q.push(v); comp.push_back(v);
+      }
     }
+    std::sort(comp.begin(), comp.end());
+    groups.push_back(std::move(comp));
+    cid++;
+  }
+}
+
+int main(int argc, char** argv) {
+  int device = 0;
+  cudaSetDevice(device);
+
+  int numClusters = 32;  // 采样的 cluster 数，越大越容易覆盖全部 GPC/SM
+  if (argc > 1) numClusters = atoi(argv[1]);
+
+  cudaDeviceProp prop{};
+  cudaGetDeviceProperties(&prop, device);
+  const int numSM = prop.multiProcessorCount;
+
+  // 1) 启动 numClusters 个 cluster，每个 cluster 有 CLUSTER_SIZE 个 block
+  const int totalBlocks = numClusters * CLUSTER_SIZE;
+
+  // 设备端数组：每个 cluster 的每个 rank 记录一个 smid
+  int *d_smids = nullptr;
+  cudaMalloc(&d_smids, totalBlocks * sizeof(int));
+  cudaMemset(d_smids, 0xFF, totalBlocks * sizeof(int)); // -1
+
+  // 需要允许非可移植的 cluster 尺寸
+  cudaFuncSetAttribute(dump_cluster_smids,
+      cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+
+  dump_cluster_smids<<<totalBlocks, BLOCK_SIZE>>>(d_smids);
+  cudaDeviceSynchronize();
+
+  // 拷回主机
+  std::vector<int> smids(totalBlocks, -1);
+  cudaMemcpy(smids.data(), d_smids, totalBlocks * sizeof(int), cudaMemcpyDeviceToHost);
+  cudaFree(d_smids);
+
+  // 2) 基于“同一 cluster 内出现过”的关系，构建无向图
+  std::vector<std::vector<int>> adj(numSM);  // 0..numSM-1
+  auto add_edge = [&](int a, int b){
+    if (a<0 || b<0 || a>=numSM || b>=numSM || a==b) return;
+    adj[a].push_back(b);
+    adj[b].push_back(a);
+  };
+
+  for (int c = 0; c < numClusters; ++c) {
+    // 收集该 cluster 的 SMID（去重）
+    std::set<int> uniq;
+    for (int r = 0; r < CLUSTER_SIZE; ++r) {
+      int sm = smids[c*CLUSTER_SIZE + r];
+      if (sm >= 0 && sm < numSM) uniq.insert(sm);
+    }
+    if (uniq.size() <= 1) continue;
+    // 同一 cluster 内两两连边
+    std::vector<int> v(uniq.begin(), uniq.end());
+    for (size_t i=0;i<v.size();++i)
+      for (size_t j=i+1;j<v.size();++j)
+        add_edge(v[i], v[j]);
   }
 
-#ifdef CALC_BW
-  if (ok) {
-    // 带宽口径：我们在 device 端记录的是总 cycles，换算 GB/s
-    // bytes = num_ints*sizeof(int) * ITERATION * （近似每线程一次？这里带宽口径仅供参考）
-    // 建议在 LATENCY 模式下用于判定；若坚持带宽，可按你的统计口径调整 bytes 定义。
-    const unsigned long long cycles = (unsigned long long)h_avg[ok_cluster];
-    const unsigned long long bytes  = (unsigned long long)num_ints * sizeof(int) * ITERATION;
-    const double bpc = (double)bytes / (double)cycles;
-    const double bw  = bpc * clkHz / 1e9;
-    printf("Cluster %d destSM%d srcSM%d [DSMEM] Bandwidth %.4f GB/s  -> SAME_GPC\n",
-           ok_cluster, dstSM, srcSM, bw);
-  } else {
-    printf("destSM%d srcSM%d [DSMEM] pairing failed after %d attempts -> LIKELY DIFFERENT_GPC\n",
-           dstSM, srcSM, MAX_ATTEMPTS);
-  }
-#else
-  if (ok) {
-    // 延迟口径：cycles/group
-    const double avg = h_avg[ok_cluster];
-    printf("Cluster %d destSM%d srcSM%d [DSMEM] Avg %.2f cycles/group  -> SAME_GPC\n",
-           ok_cluster, dstSM, srcSM, avg);
-  } else {
-    printf("destSM%d srcSM%d [DSMEM] pairing failed after %d attempts -> LIKELY DIFFERENT_GPC\n",
-           dstSM, srcSM, MAX_ATTEMPTS);
-  }
-#endif
+  // 3) 做连通分量 → GPC 组
+  std::vector<int> comp_id;
+  std::vector<std::vector<int>> groups;
+  bfs_groups(adj, comp_id, groups);
 
-  cudaFree(d_avg); cudaFree(d_ctl); free(h_avg); free(h_ctl);
+  // 输出结果
+  printf("Detected %d SMs on device %s (cc %d.%d)\n",
+         numSM, prop.name, prop.major, prop.minor);
+  printf("Sampled %d clusters (cluster_size=%d)\n", numClusters, CLUSTER_SIZE);
+  printf("== Inferred GPC groups (connected components) ==\n");
+  // 按组大小排序打印
+  std::sort(groups.begin(), groups.end(),
+            [](const auto& a, const auto& b){ return a.size() > b.size(); });
+
+  for (size_t gi=0; gi<groups.size(); ++gi) {
+    printf("Group %zu (size=%zu): ", gi, groups[gi].size());
+    for (size_t k=0;k<groups[gi].size();++k) {
+      printf("%d%s", groups[gi][k], (k+1==groups[gi].size())? "" : " ");
+    }
+    printf("\n");
+  }
+
+  // 4) 为每个 SM 列出同 GPC 的 SM（便于后续直接查）
+  printf("\n== Per-SM same-GPC lists ==\n");
+  for (int sm=0; sm<numSM; ++sm) {
+    if (comp_id[sm] < 0) {
+      printf("SM %d: (unseen; increase numClusters)\n", sm);
+      continue;
+    }
+    const auto& g = groups[ comp_id[sm] ];
+    printf("SM %d: ", sm);
+    for (int x: g) if (x != sm) printf("%d ", x);
+    printf("\n");
+  }
+
   return 0;
 }
