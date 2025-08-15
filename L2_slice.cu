@@ -131,7 +131,29 @@ int main(int argc, char** argv) {
   for (size_t i = 0; i < to_print; ++i) {
     printf("addr+%8zub : %u cycles\n", i * strideB, h_lat[i]);
   }
-
+  // host 端 main 末尾
+  // 假设 total_bytes = L2 Cache 大小，strideB = 访问步长
+  size_t total_bytes = l2_size_bytes; // 由 cudaDeviceProp.l2CacheSize 获取
+  size_t strideB = 4; // 每次访问 4 字节（int）
+  
+  size_t total_accesses = total_bytes / strideB;
+  std::vector<unsigned> h_lat(total_accesses);
+  
+  // device kernel 中每个线程负责测试一个地址的延迟
+  // 然后在 host 端收集 h_lat
+  
+  // --- 保存到 CSV 文件 ---
+  FILE* fp = fopen("l2_latency_full.csv", "w");
+  if (!fp) {
+      fprintf(stderr, "无法创建 CSV 文件\n");
+      return 1;
+  }
+  fprintf(fp, "Offset_bytes,Latency_cycles\n");
+  for (size_t i = 0; i < total_accesses; ++i) {
+      fprintf(fp, "%zu,%u\n", i * strideB, h_lat[i]);
+  }
+  fclose(fp);
+  printf("已将延迟数据写入 l2_latency_full.csv\n");
   cudaFree(d_done);
   cudaFree(d_lat);
   cudaFree(d_buf);
