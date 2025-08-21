@@ -1,151 +1,132 @@
-// nvcc -O3 -arch=sm_80 -DDISABLE_L1 l2_line_probe.cu -o l2_line_probe
-// (Hopper/Blackwell 改成对应 -arch，例如 sm_90 / sm_100)
+// nvcc -O3 -arch=sm_90 l2_sector_probe_ldcg.cu -o l2_sector_probe_ldcg
+// Ampere 用 -arch=sm_80；Blackwell 用对应 sm_XX
 
 #include <cstdio>
 #include <vector>
+#include <algorithm>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#ifndef WARM_STEPS
+#define WARM_STEPS (1<<18)   // 预热解引用次数（把工作集放进 L2）
+#endif
+#ifndef MEAS_STEPS
+#define MEAS_STEPS (1<<21)   // 计时解引用次数（依赖链，真实延迟）
+#endif
 #ifndef REPEATS
-#define REPEATS 200        // 每个 delta 重复次数
+#define REPEATS 3            // 每个 delta 重复次数，取中位数更稳
 #endif
 
-#ifndef FLUSH_MULT
-#define FLUSH_MULT 3       // 冲刷区大小 = FLUSH_MULT * L2_size
-#endif
-
-// 选择加载修饰符：默认关闭L1，只有L2（.cg）
-#ifdef DISABLE_L1
-#define LD_MOD "ld.global.cg.u32"   // L2-only
-#else
-#define LD_MOD "ld.global.ca.u32"   // L1+L2
-#endif
-
-// 只从 L2 加载一个 u32（绕过 L1）
-__device__ __forceinline__ uint32_t ldg_l2_u32(const uint32_t* p) {
-    uint32_t v;
-    asm volatile(LD_MOD " %0, [%1];" : "=r"(v) : "l"(p));
-    return v;
+// L2-only 加载
+__device__ __forceinline__ unsigned long long ld_l2_u64(const unsigned long long* p){
+    return __ldcg(p); // 只经由 L2，绕过 L1
 }
 
-// 冲刷 L2：读取 flush_buf（步长取 128B）保证替换掉之前的缓存行
-__device__ __forceinline__ void flush_L2(const uint8_t* flush_buf, size_t flush_bytes) {
-    volatile uint32_t sink = 0;
-    for (size_t off = 0; off + 128 <= flush_bytes; off += 128) {
-        sink += ldg_l2_u32(reinterpret_cast<const uint32_t*>(flush_buf + off));
+// 依赖链：p = *p
+__device__ __forceinline__ unsigned long long* chase_once(unsigned long long* p){
+    unsigned long long nxt = ld_l2_u64((const unsigned long long*)p);
+    return (unsigned long long*)nxt;
+}
+
+__global__ void pc_kernel(unsigned long long* start,
+                          const unsigned long long* flush, size_t flush_u64s,
+                          unsigned long long* out_cycles) {
+    if (blockIdx.x || threadIdx.x) return;
+
+    // 轻量冲刷：触碰一片远大于工作集的区域，替换掉旧 L2 内容
+    unsigned long long sink = 0;
+    for (size_t i = 0; i < flush_u64s; i += 32)
+        sink += __ldcg(flush + i);
+    if (sink == 0xdeadbeefULL) asm volatile("");
+
+    // 预热：把链表工作集驻留到 L2
+    unsigned long long* p = start;
+    for (int i = 0; i < WARM_STEPS; ++i) p = chase_once(p);
+
+    // 计时（依赖链确保串行化，无法被乱序/合并隐藏）
+    unsigned long long* q = p;
+    unsigned long long t0 = clock64();
+#pragma unroll 1
+    for (int i = 0; i < MEAS_STEPS; ++i) q = chase_once(q);
+    unsigned long long t1 = clock64();
+
+    if (((uintptr_t)q & 1ULL) == 0xFFFFFFFFULL) asm volatile(""); // 防优化
+    *out_cycles = (t1 - t0) / (unsigned long long)MEAS_STEPS;
+}
+
+static void ck(cudaError_t e, const char* msg){
+    if (e != cudaSuccess){ fprintf(stderr, "%s: %s\n", msg, cudaGetErrorString(e)); exit(1); }
+}
+
+// 在 d_region 上按 delta 字节一节点构造环形链表；返回起点
+unsigned long long* build_ring(void* d_region, size_t region_bytes, int delta_bytes){
+    if (delta_bytes < 8) delta_bytes = 8;
+    delta_bytes = (delta_bytes + 7) & ~7; // 8B 对齐
+    size_t nodes = region_bytes / (size_t)delta_bytes;
+    if (nodes < 2) { fprintf(stderr, "region too small for delta=%d\n", delta_bytes); exit(1); }
+
+    // 在 host 侧写入“下一节点”的设备地址
+    std::vector<unsigned char> host(region_bytes, 0);
+    auto base = (uintptr_t)d_region;
+    for (size_t i = 0; i < nodes; ++i){
+        uintptr_t curr = base + i * (uintptr_t)delta_bytes;
+        uintptr_t next = base + ((i + 1) % nodes) * (uintptr_t)delta_bytes;
+        *reinterpret_cast<unsigned long long*>(&host[i * (size_t)delta_bytes]) =
+            (unsigned long long)next;
     }
-    if (sink == 0xdeadbeef) asm volatile(""); // 防止被优化
+    ck(cudaMemcpy(d_region, host.data(), region_bytes, cudaMemcpyHostToDevice), "memcpy ring");
+    return (unsigned long long*)base;
 }
 
-// 计时某个 delta 的平均延迟（cycles）
-__global__ void measure_kernel(uint8_t* base_aligned,
-                               uint8_t* flush_buf,
-                               size_t   flush_bytes,
-                               const int* deltas,
-                               int      ndeltas,
-                               unsigned long long* out_cycles) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-
-    for (int i = 0; i < ndeltas; ++i) {
-        int delta = deltas[i];
-        unsigned long long acc = 0;
-
-        // 每个 delta 重复多次求均值
-        for (int r = 0; r < REPEATS; ++r) {
-            // 1) 冲刷 L2，清空历史
-            flush_L2(flush_buf, flush_bytes);
-
-            // 2) 预取/加载 A，确保 A 所在的 cache line 进入 L2
-            (void)ldg_l2_u32(reinterpret_cast<const uint32_t*>(base_aligned));
-
-            // 内存屏障，避免后续访问跑在前面
-            asm volatile("membar.gl;");
-
-            // 3) 计时访问 B = A + delta
-            unsigned long long t0 = clock64();
-            uint32_t v = ldg_l2_u32(reinterpret_cast<const uint32_t*>(base_aligned + delta));
-            unsigned long long t1 = clock64();
-
-            acc += (t1 - t0);
-
-            // 避免优化（使用读到的值）
-            if ((v & 0xFFFFFFFFu) == 0x12345678u) asm volatile("");
-        }
-        out_cycles[i] = acc / REPEATS;
-    }
-}
-
-int main() {
+int main(){
     int dev = 0;
-    cudaDeviceProp prop{};
-    cudaGetDeviceProperties(&prop, dev);
+    cudaSetDevice(dev);
 
-    int l2_bytes = 0;
-    cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, dev);
-    if (l2_bytes <= 0) {
-        // 某些旧驱动可能返回 0，取保守值
-        l2_bytes = 64 << 20; // 64MB
+    cudaDeviceProp prop{};  cudaGetDeviceProperties(&prop, dev);
+    int l2_bytes = 0;       cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, dev);
+    if (l2_bytes <= 0) l2_bytes = 64<<20; // 兜底
+
+    printf("Device: %s\nL2 size: %d bytes\n", prop.name, l2_bytes);
+
+    // 工作集：<= L2 的 1/8（最大 8MB），确保可完全命中
+    size_t ring_bytes  = std::min((size_t)l2_bytes / 8, (size_t)8<<20);
+    // 冲刷水：2×L2（最少 16MB）
+    size_t flush_bytes = std::max((size_t)l2_bytes * 2ull, (size_t)16<<20);
+
+    // 256B 对齐
+    void* d_region_raw = nullptr; ck(cudaMalloc(&d_region_raw, ring_bytes + 256), "malloc region");
+    uintptr_t a = ((uintptr_t)d_region_raw + 255ull) & ~255ull;
+    void* d_region = (void*)a;
+
+    unsigned long long* d_flush = nullptr; ck(cudaMalloc((void**)&d_flush, flush_bytes), "malloc flush");
+    ck(cudaMemset(d_flush, 0, flush_bytes), "memset flush");
+
+    // 扫描的 delta（可按需扩展）
+    std::vector<int> deltas = {8,16,24,32,40,48,56,64,80,96,112,128,160,192,224,256,320,384,448,512};
+
+    unsigned long long* d_out = nullptr; ck(cudaMalloc(&d_out, sizeof(unsigned long long)), "malloc out");
+
+    printf("\n# delta_bytes, avg_cycles (pointer-chasing via __ldcg, L2-only)\n");
+    for (int delta : deltas){
+        // 每个 delta 重建一次环，确保严格的物理间隔
+        unsigned long long* start = build_ring(d_region, ring_bytes, delta);
+
+        // 重复多次，取中位数
+        std::vector<unsigned long long> reps;
+        for (int r = 0; r < REPEATS; ++r){
+            pc_kernel<<<1,1>>>(start, d_flush, flush_bytes/8, d_out);
+            cudaDeviceSynchronize();
+            unsigned long long cyc;
+            ck(cudaMemcpy(&cyc, d_out, sizeof(cyc), cudaMemcpyDeviceToHost), "copy out");
+            reps.push_back(cyc);
+        }
+        std::sort(reps.begin(), reps.end());
+        unsigned long long med = reps[REPEATS/2];
+        printf("%4d, %llu\n", delta, med);
     }
 
-    printf("Device: %s\n", prop.name);
-    printf("L2 size: %d bytes\n", l2_bytes);
-#ifdef DISABLE_L1
-    printf("Load mode: ld.global.cg (L2 only, L1 disabled)\n");
-#else
-    printf("Load mode: ld.global.ca (L1+L2)\n");
-#endif
-    printf("Repeats per delta: %d\n", REPEATS);
-
-    // 扫描的 delta（字节）
-    std::vector<int> deltas = {
-        16, 32, 48, 64, 80, 96, 112, 128,
-        144, 160, 192, 224, 256, 288, 320, 384, 448, 512
-    };
-    const int nd = (int)deltas.size();
-
-    // ---- 分配显存 ----
-    // 冲刷区：FLUSH_MULT × L2 容量
-    size_t flush_bytes = static_cast<size_t>(l2_bytes) * FLUSH_MULT;
-    uint8_t* d_flush = nullptr;
-    cudaMalloc(&d_flush, flush_bytes);
-    cudaMemset(d_flush, 0, flush_bytes);
-
-    // 基地址区域：需要 >= 最大 delta + 256 对齐裕量 + 4 字节
-    int max_delta = deltas.back();
-    size_t base_bytes = (size_t)max_delta + 512; // 多给一点，便于 256B 对齐
-    uint8_t* d_base_raw = nullptr;
-    cudaMalloc(&d_base_raw, base_bytes);
-    cudaMemset(d_base_raw, 0xA5, base_bytes);
-
-    // 让 base 对齐到 256B（通常 >= cache line）
-    uintptr_t addr = reinterpret_cast<uintptr_t>(d_base_raw);
-    uintptr_t aligned = (addr + 255u) & ~uintptr_t(255u);
-    uint8_t* d_base_aligned = reinterpret_cast<uint8_t*>(aligned);
-
-    // deltas、结果数组
-    int* d_deltas = nullptr;
-    unsigned long long* d_out = nullptr;
-    cudaMalloc(&d_deltas, nd * sizeof(int));
-    cudaMalloc(&d_out,    nd * sizeof(unsigned long long));
-    cudaMemcpy(d_deltas, deltas.data(), nd * sizeof(int), cudaMemcpyHostToDevice);
-
-    // ---- 启动核函数 ----
-    measure_kernel<<<1,1>>>(d_base_aligned, d_flush, flush_bytes, d_deltas, nd, d_out);
-    cudaDeviceSynchronize();
-
-    std::vector<unsigned long long> out(nd);
-    cudaMemcpy(out.data(), d_out, nd * sizeof(unsigned long long), cudaMemcpyDeviceToHost);
-
-    // ---- 打印结果 ----
-    printf("\n# delta_bytes, avg_cycles (L2-only)\n");
-    for (int i = 0; i < nd; ++i) {
-        printf("%4d, %llu\n", deltas[i], out[i]);
-    }
-
-    // 资源回收
     cudaFree(d_out);
-    cudaFree(d_deltas);
-    cudaFree(d_base_raw);
     cudaFree(d_flush);
+    cudaFree(d_region_raw);
     return 0;
 }
