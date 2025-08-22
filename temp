@@ -1,1 +1,30 @@
 
+NVCC        := nvcc
+NVCC_FLAGS  := -Xptxas -dlcm=cg -O3
+
+SRC         := main.cu
+TARGET      := BW
+
+# Default architecture; can be set to v100, a100, or h100.
+ARCH_FLAGS := -arch=sm_90
+
+PTX_OUT     := $(basename $(SRC)).ptx   # main.ptx
+
+.PHONY: all clean ptx show-ptx
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(NVCC) $(NVCC_FLAGS) $(ARCH_FLAGS) $(NVCC_DEFS) -o $@ $<
+
+# ---- 生成 PTX 文件 ----
+ptx: $(SRC)
+	$(NVCC) $(ARCH_FLAGS) $(NVCC_DEFS) -ptx -o $(PTX_OUT) $<
+	@echo "PTX written to $(PTX_OUT)"
+
+# ---- 打印 PTX 到终端 ----
+show-ptx: ptx
+	@cat $(PTX_OUT)
+
+clean:
+	rm -f $(TARGET) $(PTX_OUT)
